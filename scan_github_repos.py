@@ -1,4 +1,3 @@
-
 import os
 import subprocess
 import sys
@@ -26,22 +25,8 @@ CERT_EXTENSIONS = (".jks", ".p12", ".pfx")
 # Directories to exclude
 IGNORE_DIRS = {".git", ".github", ".vscode", "node_modules", "build", "dist", "target", "out"}
 
-# Generate timestamp for CSV filename
+# Generate timestamp for filenames
 timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-# CSV Output File
-OUTPUT_CSV = os.path.join(OUTPUT_CSV_DIR, f"certificates_{timestamp_str}.csv")
-
-# Log file
-LOG_FILE = os.path.join(LOGS_DIR, "scan_certificates.log")
-SUMMARY_LOG_FILE = os.path.join(LOGS_DIR, "summary.log")
-
-# Setup Logging
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
 
 # Thread-Safe Queue for Storing Results
 results_queue = Queue()
@@ -53,6 +38,37 @@ lock = threading.Lock()
 repos_with_jks = 0
 repos_skipped_no_jks = 0
 repos_failed_to_clone = 0
+
+def setup_logging(org_name):
+    """Setup logging with org name and timestamp in log filenames."""
+    # Log files with org name and timestamp
+    INFO_LOG_FILE = os.path.join(LOGS_DIR, f"scan_certificates_info_{org_name}_{timestamp_str}.log")
+    ERROR_LOG_FILE = os.path.join(LOGS_DIR, f"scan_certificates_error_{org_name}_{timestamp_str}.log")
+    SUMMARY_LOG_FILE = os.path.join(LOGS_DIR, f"summary_{org_name}_{timestamp_str}.log")
+
+    # Clear any existing handlers
+    logger = logging.getLogger()
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+
+    # Set the root logger level to DEBUG to capture all messages
+    logger.setLevel(logging.DEBUG)
+
+    # Info handler (for INFO and WARNING messages)
+    info_handler = logging.FileHandler(INFO_LOG_FILE)
+    info_handler.setLevel(logging.INFO)  # Capture INFO and above
+    info_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    info_handler.setFormatter(info_formatter)
+    logger.addHandler(info_handler)
+
+    # Error handler (for ERROR messages)
+    error_handler = logging.FileHandler(ERROR_LOG_FILE)
+    error_handler.setLevel(logging.ERROR)  # Capture only ERROR messages
+    error_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    error_handler.setFormatter(error_formatter)
+    logger.addHandler(error_handler)
+
+    return SUMMARY_LOG_FILE
 
 def check_github_cli_authentication():
     """Check if GitHub CLI is authenticated."""
@@ -180,43 +196,76 @@ def find_certificate_files(repo_path):
     return cert_files
 
 def extract_aliases(cert_file):
-    """Extract alias names from JKS/P12/PFX files using keytool"""
+    """Extract alias names from JKS/P12/PFX files using keytool."""
     try:
+        # First attempt: Try with the default password "changeit"
         result = subprocess.run(
             ["keytool", "-list", "-v", "-keystore", cert_file, "-storepass", "changeit"],
             capture_output=True, text=True, timeout=10, input="\n",
         )
 
+        # If the command fails, try without -storepass and handle the password prompt
+        if result.returncode != 0:
+            logging.warning(f"Default password failed for {cert_file}. Attempting to prompt for password.")
+            result = subprocess.run(
+                ["keytool", "-list", "-v", "-keystore", cert_file],
+                capture_output=True, text=True, timeout=10, input="\n\n",  # Simulate pressing Enter twice
+            )
+
+        # If the command still fails, log the error and return an empty list
+        if result.returncode != 0:
+            logging.error(f"Failed to extract aliases from {cert_file}: {result.stderr}")
+            return []
+
         # Filter lines containing "Alias name"
         aliases = [line.split(":")[-1].strip() for line in result.stdout.split("\n") if "Alias name" in line]
         return aliases
-    
+
     except subprocess.CalledProcessError as e:
         logging.error(f"Error executing keytool on {cert_file}: {e}")
     except subprocess.TimeoutExpired:
         logging.error(f"Timeout while processing {cert_file}")
+    except Exception as e:
+        logging.error(f"Unexpected error processing {cert_file}: {e}")
 
     return []
 
 def extract_valid_from(cert_file):
     """Extract 'Valid from' dates from JKS/P12/PFX files using keytool."""
     try:
+        # First attempt: Try with the default password "changeit"
         result = subprocess.run(
             ["keytool", "-list", "-v", "-keystore", cert_file, "-storepass", "changeit"],
             capture_output=True, text=True, timeout=10, input="\n",
         )
 
+        # If the command fails, try without -storepass and handle the password prompt
+        if result.returncode != 0:
+            logging.warning(f"Default password failed for {cert_file}. Attempting to prompt for password.")
+            result = subprocess.run(
+                ["keytool", "-list", "-v", "-keystore", cert_file],
+                capture_output=True, text=True, timeout=10, input="\n\n",  # Simulate pressing Enter twice
+            )
+
+        # If the command still fails, log the error and return an empty list
+        if result.returncode != 0:
+            logging.error(f"Failed to extract valid-from dates from {cert_file}: {result.stderr}")
+            return []
+
+        # Extract 'Valid from' dates
         valid_from_metadata = []
         for line in result.stdout.split("\n"):
             if "Valid from" in line:
                 valid_from_metadata.append(line.strip())
 
         return valid_from_metadata
-    
+
     except subprocess.CalledProcessError as e:
         logging.error(f"Error executing keytool for valid-from extraction on {cert_file}: {e}")
     except subprocess.TimeoutExpired:
         logging.error(f"Timeout while extracting valid from-date from {cert_file}")
+    except Exception as e:
+        logging.error(f"Unexpected error processing {cert_file}: {e}")
 
     return []
 
@@ -308,25 +357,31 @@ def process_certificates_parallel(cert_files):
                 with lock:
                     results_queue.put([alias, valid_from, cert_file, repo_name, org_name, contributors, expiry_status])
 
-def save_results_to_csv():
+def save_results_to_csv(org_name):
     """Save results from queue to CSV"""
     data = []
     while not results_queue.empty():
         data.append(results_queue.get())
 
+    # Include org name and timestamp in the CSV filename
+    OUTPUT_CSV = os.path.join(OUTPUT_CSV_DIR, f"certificates_{org_name}_{timestamp_str}.csv")
+
     df = pd.DataFrame(data, columns=["Alias Name", "Valid From", "File Path", "Repository", "Organization", "Repo Owner", "Expiry"])
     df.to_csv(OUTPUT_CSV, index=False)
     logging.info(f"Results saved to {OUTPUT_CSV}")
 
-def write_summary_log():
+def write_summary_log(summary_log_file):
     """Write summary log file"""
-    with open(SUMMARY_LOG_FILE, "w") as f:
+    with open(summary_log_file, "w") as f:
         f.write(f"Repositories with JKS files: {repos_with_jks}\n")
         f.write(f"Repositories skipped (no JKS files): {repos_skipped_no_jks}\n")
         f.write(f"Repositories failed to clone: {repos_failed_to_clone}\n")
 
 def main(github_orgs):
     """Main execution function with multithreading"""
+    # Setup logging for the first organization (logging is global, so it only needs to be done once)
+    setup_logging(github_orgs[0])
+
     # Check GitHub CLI authentication before proceeding
     if not check_github_cli_authentication():
         logging.error("GitHub CLI authentication failed. Exiting.")
@@ -354,10 +409,13 @@ def main(github_orgs):
         process_certificates_parallel(all_cert_files)
 
         # Save final results to CSV
-        save_results_to_csv()
+        for org in github_orgs:
+            save_results_to_csv(org)
 
         # Write summary log
-        write_summary_log()
+        for org in github_orgs:
+            summary_log_file = os.path.join(LOGS_DIR, f"summary_{org}_{timestamp_str}.log")
+            write_summary_log(summary_log_file)
 
 if __name__ == "__main__":
     # Parse command-line arguments
@@ -388,4 +446,3 @@ if __name__ == "__main__":
     else:
         # Run the script in the foreground
         main(args.orgs)
-
