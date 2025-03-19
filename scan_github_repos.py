@@ -231,7 +231,7 @@ def extract_aliases(cert_file):
     return []
 
 def extract_valid_from(cert_file):
-    """Extract 'Valid from' dates from JKS/P12/PFX files using keytool."""
+    """Extract 'Valid from' and 'until' dates from JKS/P12/PFX files using keytool and reformat them."""
     try:
         # First attempt: Try with the default password "changeit"
         result = subprocess.run(
@@ -247,18 +247,67 @@ def extract_valid_from(cert_file):
                 capture_output=True, text=True, timeout=10, input="\n\n",  # Simulate pressing Enter twice
             )
 
-        # If the command still fails, log the error and return an empty list
+        # If the command still fails, log the error and return empty values
         if result.returncode != 0:
             logging.error(f"Failed to extract valid-from dates from {cert_file}: {result.stderr}")
-            return []
+            return None, None
 
-        # Extract 'Valid from' dates
-        valid_from_metadata = []
+        # Extract 'Valid from' and 'until' dates
+        valid_from = None
+        until = None
         for line in result.stdout.split("\n"):
-            if "Valid from" in line:
-                valid_from_metadata.append(line.strip())
+            if "Valid from:" in line:
+                # Log the raw line for debugging
+                logging.info(f"Raw line from keytool output: {line}")
 
-        return valid_from_metadata
+                # Split the line into 'Valid from' and 'until' parts
+                parts = line.split("until:")
+                if len(parts) == 2:
+                    valid_from_str = parts[0].split("Valid from:")[-1].strip()
+                    until_str = parts[1].strip()
+
+                    # Log the extracted strings for debugging
+                    logging.info(f"Extracted Valid from string: {valid_from_str}")
+                    logging.info(f"Extracted Until string: {until_str}")
+
+                    # Parse and reformat the dates
+                    try:
+                        # Try parsing with multiple possible formats
+                        date_formats = [
+                            "%a %b %d %H:%M:%S %Z %Y",  # Format 1 and 2
+                            "%a %b %d %H:%M:%S GMT%z %Y",  # Format 3
+                        ]
+
+                        valid_from_date = None
+                        until_date = None
+
+                        for date_format in date_formats:
+                            try:
+                                valid_from_date = datetime.strptime(valid_from_str, date_format)
+                                until_date = datetime.strptime(until_str, date_format)
+                                break  # Exit loop if parsing succeeds
+                            except ValueError:
+                                continue  # Try the next format
+
+                        if valid_from_date is None or until_date is None:
+                            raise ValueError("Date format not recognized")
+
+                        # Log the parsed dates for debugging
+                        logging.info(f"Parsed Valid from date: {valid_from_date}")
+                        logging.info(f"Parsed Until date: {until_date}")
+
+                        # Reformat to m/d/yyyy h:mm format
+                        valid_from = valid_from_date.strftime("%m/%d/%Y %H:%M")
+                        until = until_date.strftime("%m/%d/%Y %H:%M")
+
+                        # Log the reformatted dates for debugging
+                        logging.info(f"Reformatted Valid from: {valid_from}")
+                        logging.info(f"Reformatted Until: {until}")
+                    except ValueError as e:
+                        logging.error(f"Error parsing date for {cert_file}: {e}")
+                        valid_from, until = None, None
+
+        return valid_from, until
 
     except subprocess.CalledProcessError as e:
         logging.error(f"Error executing keytool for valid-from extraction on {cert_file}: {e}")
@@ -267,7 +316,7 @@ def extract_valid_from(cert_file):
     except Exception as e:
         logging.error(f"Unexpected error processing {cert_file}: {e}")
 
-    return []
+    return None, None
 
 def check_expiry(valid_from_metadata):
     """Check if the certificate is expired based on the 'until' date."""
@@ -310,7 +359,7 @@ def process_repository(repo_url, org_name, clone_dir):
         repos_with_jks += 1
         contributors = get_repo_contributors(repo_url)
         return [(cert_file, repo_name, org_name, contributors) for cert_file in cert_files]
-    
+
     except Exception as e:
         logging.error(f"Error processing repository {repo_name}: {e}")
         repos_failed_to_clone += 1
@@ -338,24 +387,24 @@ def process_certificates_parallel(cert_files):
         for future in as_completed(future_to_cert_valid):
             cert_file = future_to_cert_valid[future]
             try:
-                valid_from_results[cert_file] = future.result() or []
+                valid_from_results[cert_file] = future.result() or (None, None)
             except Exception as e:
                 logging.error(f"Error extracting valid-from from {cert_file}: {e}")
-                valid_from_results[cert_file] = []
+                valid_from_results[cert_file] = (None, None)
 
         # Store results in queue without ensuring list lengths
         for cert_file in cert_files:
             repo_name, org_name, contributors = cert_files[cert_file]
             aliases = aliases_results.get(cert_file, [])
-            valid_from_dates = valid_from_results.get(cert_file, [])
+            valid_from, until = valid_from_results.get(cert_file, (None, None))
 
             # Check expiry status
-            expiry_status = check_expiry(valid_from_dates)
+            expiry_status = check_expiry([f"Valid from: {valid_from}", f"until: {until}"]) if valid_from and until else "Unknown"
 
-            # Directly pair available aliases with valid from dates
-            for alias, valid_from in zip(aliases, valid_from_dates):
+            # Directly pair available aliases with valid from and until dates
+            for alias in aliases:
                 with lock:
-                    results_queue.put([alias, valid_from, cert_file, repo_name, org_name, contributors, expiry_status])
+                    results_queue.put([alias, valid_from, until, cert_file, repo_name, org_name, contributors, expiry_status])
 
 def save_results_to_csv(org_name):
     """Save results from queue to CSV"""
@@ -366,7 +415,11 @@ def save_results_to_csv(org_name):
     # Include org name and timestamp in the CSV filename
     OUTPUT_CSV = os.path.join(OUTPUT_CSV_DIR, f"certificates_{org_name}_{timestamp_str}.csv")
 
-    df = pd.DataFrame(data, columns=["Alias Name", "Valid From", "File Path", "Repository", "Organization", "Repo Owner", "Expiry"])
+    # Define column names
+    columns = ["Alias Name", "Valid From", "Until", "File Path", "Repository", "Organization", "Repo Owner", "Expiry"]
+
+    # Create DataFrame and save to CSV
+    df = pd.DataFrame(data, columns=columns)
     df.to_csv(OUTPUT_CSV, index=False)
     logging.info(f"Results saved to {OUTPUT_CSV}")
 
